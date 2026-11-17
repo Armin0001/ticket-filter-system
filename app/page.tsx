@@ -15,59 +15,16 @@ import { Ticket } from "@/types/ticket";
 import FilterBar from "@/components/FilterBar";
 import { toast, ToastContainer } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
+// The filtering rules are plain functions in lib/, unit tested without Firestore or React.
+import { matchesDateBuckets, planQuery } from "@/lib/firestoreQuery";
+import { parseUrlFilter } from "@/lib/urlFilter";
+import {
+  displayValue as getDisplayValue,
+  formatTimestamp as formatTimestampWithTime,
+  searchBySubject,
+} from "@/lib/tickets";
 
-function formatTimestampWithTime(timestamp: any): string {
-  if (!timestamp) return "unassigned";
-  const date = new Date(timestamp.seconds * 1000);
-  const day = String(date.getDate()).padStart(2, "0");
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const year = date.getFullYear();
-  const hours = String(date.getHours()).padStart(2, "0");
-  const minutes = String(date.getMinutes()).padStart(2, "0");
-  return `${day}.${month}.${year} ${hours}:${minutes}`;
-}
-
-// Keeping date utilities local for clean client-side range calculations
-function checkTimestampInRange(timestamp: any, category: string): boolean {
-  if (!timestamp || !timestamp.seconds) return false;
-  const ticketDate = new Date(timestamp.seconds * 1000).getTime();
-
-  const today = new Date();
-  const zero = (d: Date) =>
-    new Date(d.getFullYear(), d.getMonth(), d.getDate());
-
-  const todayStart = zero(today).getTime();
-  const yesterdayStart = todayStart - 86400000;
-  const lastWeekStart = todayStart - 7 * 86400000;
-  const lastMonthStart = todayStart - 30 * 86400000;
-  const tomorrowStart = todayStart + 86400000;
-
-  switch (category) {
-    case "today":
-      return ticketDate >= todayStart && ticketDate < tomorrowStart;
-    case "yesterday":
-      return ticketDate >= yesterdayStart && ticketDate < todayStart;
-    case "last week":
-      return ticketDate >= lastWeekStart && ticketDate < yesterdayStart;
-    case "last month":
-      return ticketDate >= lastMonthStart && ticketDate < lastWeekStart;
-    default:
-      return true;
-  }
-}
-
-function getTicketProperty(input: string | null): Record<string, any> {
-  if (!input) return { error: "no param" };
-  const priorities = ["low", "medium", "high", "urgent"];
-  const folders = ["spam", "trash", "archive", "inbox"];
-  const statuses = ["open", "pending", "solved", "closed", "on-hold"];
-
-  if (priorities.includes(input))
-    return { priority: [input.charAt(0).toUpperCase() + input.slice(1)] };
-  if (folders.includes(input)) return { folder: [input] };
-  if (statuses.includes(input)) return { status: [input] };
-  return { error: "Unknown input" };
-}
+const getTicketProperty = parseUrlFilter;
 
 const STATUS_COLOR: Record<string, string> = {
   open: "bg-sky-100 text-sky-700",
@@ -91,12 +48,6 @@ const PRIORITY_ICON: Record<string, string> = {
   Low: "↓",
 };
 
-function getDisplayValue(value: any): any {
-  return (value && typeof value === "string" && value.trim() !== "") ||
-    (Array.isArray(value) && value.length > 0)
-    ? value
-    : "unassigned";
-}
 
 export default function TicketsPageWrapper() {
   return (
@@ -168,45 +119,18 @@ function TicketsPage() {
       const hasFilters = Object.keys(activeFilters).length !== 0;
 
       if (hasFilters) {
+        // Field filters become Firestore `where` clauses; date buckets are checked here in the
+        // browser (see lib/firestoreQuery.ts for why).
+        const plan = planQuery(activeFilters);
         let myQuery: any = collection(db, "myNewTickets");
-        let clientDateFilters: Record<string, string> = {};
-
-        Object.entries(activeFilters).forEach(([key, value]) => {
-          // Divert programmatic date categories into our custom client-side pipeline
-          if (
-            key === "dateCreated" ||
-            key === "lastActivity" ||
-            key === "lastMessage"
-          ) {
-            clientDateFilters[key] = value;
-            return;
-          }
-
-          const newKey = key.charAt(0).toLowerCase() + key.slice(1);
-          if (key === "followers" || key === "Tags") {
-            myQuery = query(
-              myQuery,
-              where(newKey, "array-contains-any", value),
-            );
-          } else {
-            myQuery = query(myQuery, where(newKey, "in", value));
-          }
-        });
+        for (const filter of plan.server) {
+          myQuery = query(myQuery, where(filter.field, filter.op, filter.values));
+        }
 
         const filteredSnapshot = await getDocs(myQuery);
-        let docs = filteredSnapshot.docs.map(
-          (d) => ({ ...(d.data() as Record<string, any>), id: d.id }) as Ticket,
-        );
-        // Execute dynamic runtime filtering on client side to remain independent from database index rules
-        if (Object.keys(clientDateFilters).length > 0) {
-          docs = docs.filter((ticket) => {
-            return Object.entries(clientDateFilters).every(
-              ([field, category]) => {
-                return checkTimestampInRange((ticket as any)[field], category);
-              },
-            );
-          });
-        }
+        const docs = filteredSnapshot.docs
+          .map((d: any) => ({ ...(d.data() as Record<string, any>), id: d.id }) as Ticket)
+          .filter((ticket: Ticket) => matchesDateBuckets(ticket, plan.dateBuckets));
 
         setFilteredTickets(docs);
         setOrigFiltered(docs);
@@ -350,17 +274,9 @@ function TicketsPage() {
 
   const handleInputChange = (value: string) => {
     setInputValue(value);
-    if (value !== "") {
-      const filterBySearch = (list: Ticket[]) =>
-        list.filter((item) =>
-          item.subject.toLowerCase().includes(value.toLowerCase()),
-        );
-      setFilteredTickets(filterBySearch(filteredTickets));
-      setTickets(filterBySearch(tickets));
-    } else {
-      setFilteredTickets(origFiltered);
-      setTickets(orig);
-    }
+    // Search the full lists every time, so deleting characters brings results back.
+    setFilteredTickets(searchBySubject(origFiltered, value));
+    setTickets(searchBySubject(orig, value));
   };
 
   const updateTicket = async (
